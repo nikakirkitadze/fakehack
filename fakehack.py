@@ -19,12 +19,19 @@ Examples:
   fakehack --message "got you!" # custom reveal line
   fakehack --no-reveal          # skip the GOTCHA screen, just restore
   fakehack --selftest           # print one static frame (no takeover) and exit
+
+  fakehack tv                   # cast the hacked screen to an LG webOS TV (no mirroring)
+  fakehack tv --ip 192.168.1.5 --word PWNED
 """
 
 import argparse
+import base64
+import json
 import os
 import random
 import signal
+import socket
+import struct
 import sys
 import time
 
@@ -399,7 +406,7 @@ def run(args):
     return 0
 
 
-def main(argv=None):
+def main_prank(argv):
     p = argparse.ArgumentParser(
         prog="fakehack",
         description="Terminal 'you've been hacked' prank screen. Pure theater — touches nothing.",
@@ -417,7 +424,7 @@ def main(argv=None):
                    help="skip the GOTCHA reveal; just restore the terminal when done")
     p.add_argument("--selftest", action="store_true",
                    help="print one static frame to stdout (no takeover) and exit")
-    p.add_argument("--version", action="version", version="fakehack 1.0.0")
+    p.add_argument("--version", action="version", version="fakehack 1.1.0")
     args = p.parse_args(argv)
 
     # make sure Ctrl-C / kill still restore the terminal
@@ -436,6 +443,325 @@ def main(argv=None):
     except KeyboardInterrupt:
         leave_screen()
         return 130
+
+
+# ------------------------------------------------------- cast to LG webOS ----
+# A tiny, dependency-free LG webOS (SSAP) client over a secure WebSocket.
+# Modern `ssl` only (works on current Python); the registration manifest omits
+# the old shared "test" signature that 2023+ firmware blacklists.
+DEFAULT_TV_URL = "https://nikakirkitadze.github.io/fakehack/"
+
+LG_REGISTER_PAYLOAD = {
+    "forcePairing": False,
+    "pairingType": "PROMPT",
+    "manifest": {
+        "appVersion": "1.1",
+        "manifestVersion": 1,
+        "permissions": [
+            "LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CLOSE", "TEST_OPEN", "TEST_PROTECTED",
+            "CONTROL_AUDIO", "CONTROL_DISPLAY", "CONTROL_INPUT_JOYSTICK",
+            "CONTROL_INPUT_MEDIA_RECORDING", "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_TV",
+            "CONTROL_POWER", "READ_APP_STATUS", "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST",
+            "READ_NETWORK_STATE", "READ_RUNNING_APPS", "READ_TV_CHANNEL_LIST",
+            "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE", "READ_COUNTRY_INFO", "READ_SETTINGS",
+            "CONTROL_TV_SCREEN", "CONTROL_TV_STANBY", "CONTROL_FAVORITE_GROUP", "CONTROL_USER_INFO",
+            "CHECK_BLUETOOTH_DEVICE", "CONTROL_BLUETOOTH", "CONTROL_TIMER_INFO",
+            "STB_INTERNAL_CONNECTION", "CONTROL_RECORDING", "READ_RECORDING_STATE",
+            "WRITE_RECORDING_LIST", "READ_RECORDING_LIST", "READ_RECORDING_SCHEDULE",
+            "WRITE_RECORDING_SCHEDULE", "READ_STORAGE_DEVICE_LIST", "READ_TV_PROGRAM_INFO",
+            "CONTROL_BOX_CHANNEL", "READ_TV_ACR_AUTH_TOKEN", "READ_TV_CONTENT_STATE",
+            "READ_TV_CURRENT_TIME", "ADD_LAUNCHER_CHANNEL", "SET_CHANNEL_SKIP",
+            "RELEASE_CHANNEL_SKIP", "CONTROL_CHANNEL_BLOCK", "DELETE_SELECT_CHANNEL",
+            "CONTROL_CHANNEL_GROUP", "SCAN_TV_CHANNELS", "CONTROL_TV_POWER", "CONTROL_WOL",
+        ],
+    },
+}
+
+
+def _lg_ws_connect(ip, port=3001, timeout=10):
+    import ssl
+
+    raw = socket.create_connection((ip, port), timeout=timeout)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # TV uses a self-signed cert
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    sock = ctx.wrap_socket(raw, server_hostname=ip)
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = ("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+           "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+           "Sec-WebSocket-Version: 13\r\n\r\n") % (ip, port, key)
+    sock.sendall(req.encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("connection closed during handshake")
+        data += chunk
+    if b" 101 " not in data.split(b"\r\n", 1)[0]:
+        raise ConnectionError("unexpected handshake: %r" % data.split(b"\r\n", 1)[0])
+    return sock, bytearray(data[data.index(b"\r\n\r\n") + 4:])
+
+
+def _lg_frame(opcode, data=b""):
+    header = bytearray([0x80 | opcode])
+    n = len(data)
+    if n < 126:
+        header.append(0x80 | n)
+    elif n < 65536:
+        header.append(0x80 | 126); header += struct.pack("!H", n)
+    else:
+        header.append(0x80 | 127); header += struct.pack("!Q", n)
+    mask = os.urandom(4)
+    header += mask
+    return bytes(header) + bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+class _LGSocket:
+    def __init__(self, sock, buf):
+        self.sock = sock
+        self.buf = buf
+
+    def _exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed")
+            self.buf += chunk
+        out = bytes(self.buf[:n]); del self.buf[:n]; return out
+
+    def send(self, obj):
+        self.sock.sendall(_lg_frame(0x1, json.dumps(obj).encode("utf-8")))
+
+    def recv(self):
+        message = bytearray()
+        while True:
+            hdr = self._exact(2)
+            fin, opcode, masked, length = hdr[0] & 0x80, hdr[0] & 0x0F, hdr[1] & 0x80, hdr[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._exact(8))[0]
+            mask = self._exact(4) if masked else b""
+            payload = self._exact(length) if length else b""
+            if masked:
+                payload = bytes(p ^ mask[i % 4] for i, p in enumerate(payload))
+            if opcode == 0x8:
+                raise ConnectionError("TV closed the connection")
+            if opcode == 0x9:  # ping -> pong
+                self.sock.sendall(_lg_frame(0xA, payload)); continue
+            if opcode == 0xA:  # pong
+                continue
+            message += payload
+            if fin:
+                return json.loads(message.decode("utf-8", "replace"))
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def _lg_discover(timeout=4):
+    """Return the IP of the first LG webOS TV found via SSDP, or None."""
+    import re
+
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\n"
+           'MAN:"ssdp:discover"\r\nMX:2\r\nST:ssdp:all\r\n\r\n').encode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    s.settimeout(1.0)
+    for _ in range(3):
+        try:
+            s.sendto(msg, ("239.255.255.250", 1900))
+        except Exception:
+            pass
+    deadline = time.time() + timeout
+    seen = {}
+    while time.time() < deadline:
+        try:
+            data, addr = s.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+        seen.setdefault(addr[0], b"")
+        seen[addr[0]] += data
+    s.close()
+    from urllib.request import urlopen
+    for ip, raw in seen.items():
+        text = raw.decode("utf-8", "replace")
+        if re.search(r"(?i)lg|webos", text):
+            return ip
+        loc = re.search(r"(?im)^LOCATION:\s*(.+)$", text)
+        if loc:
+            try:
+                with urlopen(loc.group(1).strip(), timeout=2.0) as r:
+                    xml = r.read().decode("utf-8", "replace")
+                if re.search(r"(?i)lg electronics|webos", xml):
+                    return ip
+            except Exception:
+                pass
+    return None
+
+
+def _cast_to_lg(ip, url, client_key=None, pair_timeout=120, on_prompt=None):
+    """Pair (if needed) and open `url` in the TV browser. Returns the client-key."""
+    sock, buf = _lg_ws_connect(ip)
+    ws = _LGSocket(sock, buf)
+    payload = json.loads(json.dumps(LG_REGISTER_PAYLOAD))
+    if client_key:
+        payload["client-key"] = client_key
+    ws.send({"type": "register", "id": "register_0", "payload": payload})
+    sock.settimeout(pair_timeout)
+    key = client_key
+    while True:
+        d = ws.recv()
+        kind = d.get("type")
+        if kind == "response" and d.get("id") == "register_0":
+            if d.get("payload", {}).get("pairingType") == "PROMPT" and on_prompt:
+                on_prompt()
+        elif kind == "registered" and d.get("id") == "register_0":
+            key = d.get("payload", {}).get("client-key") or key
+            break
+        elif kind == "error":
+            ws.close()
+            raise RuntimeError(d.get("error") or "registration failed")
+    sock.settimeout(15)
+    ws.send({"type": "request", "id": "req_open",
+             "uri": "ssap://system.launcher/open", "payload": {"target": url}})
+    resp = None
+    while True:
+        d = ws.recv()
+        if d.get("id") == "req_open":
+            resp = d
+            break
+    ws.close()
+    if not (isinstance(resp, dict) and resp.get("payload", {}).get("returnValue", False)):
+        raise RuntimeError("TV did not confirm opening the page: %r" % (resp,))
+    return key
+
+
+def _tv_store_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "fakehack", "lgtv.json")
+
+
+def _load_store():
+    import json
+    try:
+        with open(_tv_store_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_store(store):
+    import json
+    path = _tv_store_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(store, f)
+    except Exception:
+        pass
+
+
+def _build_tv_url(args):
+    from urllib.parse import urlencode
+
+    params = {}
+    if args.word:
+        params["word"] = args.word
+    if args.target:
+        params["target"] = args.target
+    if args.message:
+        params["msg"] = args.message
+    if args.headline:
+        params["headline"] = args.headline
+    if args.duration and args.duration > 0:
+        params["duration"] = int(args.duration)
+    if not params:
+        return args.url
+    sep = "&" if "?" in args.url else "?"
+    return args.url + sep + urlencode(params)
+
+
+def main_tv(argv):
+    ap = argparse.ArgumentParser(
+        prog="fakehack tv",
+        description="Cast the hacked screen to an LG webOS TV over Wi-Fi — no screen mirroring. "
+                    "First run shows a one-time pairing prompt on the TV; accept it with the remote.",
+    )
+    ap.add_argument("--ip", help="TV IP address (default: auto-discover on the LAN)")
+    ap.add_argument("-w", "--word", default="HACKED", help="big banner word (default: HACKED)")
+    ap.add_argument("-t", "--target", default="DEVICE-07", help="fake victim name in the log")
+    ap.add_argument("-m", "--message", default=None, help="line under the GOTCHA reveal")
+    ap.add_argument("--headline", default=None, help="big top line (default: SYSTEM COMPROMISED)")
+    ap.add_argument("-d", "--duration", type=float, default=0,
+                    help="auto-reveal GOTCHA after N seconds (0 = stay until someone clicks the TV remote)")
+    ap.add_argument("--url", default=DEFAULT_TV_URL, help="base URL of the hosted screen")
+    ap.add_argument("--pair-timeout", type=int, default=120, help="seconds to wait for the one-time TV pairing prompt")
+    args = ap.parse_args(argv)
+
+    # Resolve the TV IP (auto-discover if not given).
+    ip = args.ip
+    if not ip:
+        sys.stderr.write("Discovering an LG webOS TV on the LAN ...\n")
+        sys.stderr.flush()
+        ip = _lg_discover()
+        if not ip:
+            sys.stderr.write("No LG TV found automatically. Re-run with --ip <address>.\n")
+            return 4
+        sys.stderr.write("Found TV at %s\n" % ip)
+
+    store = _load_store()
+    client_key = store.get(ip, {}).get("client_key")
+
+    url = _build_tv_url(args)
+    prompted = {"shown": False}
+
+    def on_prompt():
+        prompted["shown"] = True
+        sys.stderr.write(
+            "\n>> FIRST-TIME SETUP: the TV is showing a 'connect this device?' prompt.\n"
+            "   Accept it with the remote (ONE time only — every cast after this is silent).\n\n"
+        )
+        sys.stderr.flush()
+
+    try:
+        new_key = _cast_to_lg(ip, url, client_key=client_key,
+                              pair_timeout=args.pair_timeout, on_prompt=on_prompt)
+    except ConnectionError as exc:
+        sys.stderr.write("Could not reach the TV at %s: %s\n" % (ip, exc))
+        sys.stderr.write("Make sure it's ON and on the same Wi-Fi.\n")
+        return 5
+    except Exception as exc:
+        text = str(exc).lower()
+        if "cancel" in text or "denied" in text or "rejected" in text or "403" in text:
+            sys.stderr.write("The TV did not accept pairing: %s\n" % exc)
+            sys.stderr.write("Re-run and choose Accept on the TV within the time window.\n")
+            return 6
+        sys.stderr.write("Casting failed: %s\n" % exc)
+        return 7
+
+    if new_key and new_key != client_key:
+        store[ip] = {"client_key": new_key}
+        _save_store(store)
+
+    print("Hacked screen is now on the TV (%s)." % ip)
+    print("URL: %s" % url)
+    print("(silent cast — no TV confirmation needed)" if not prompted["shown"]
+          else "Paired! That was the one-time confirmation; future casts are silent.")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "tv":
+        return main_tv(argv[1:])
+    return main_prank(argv)
 
 
 if __name__ == "__main__":

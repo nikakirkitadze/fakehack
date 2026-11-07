@@ -102,6 +102,48 @@ fakehack --selftest            # print one static frame and exit (no takeover)
 
 Press **any key** at any time to cut to the reveal early.
 
+## Cast to an LG webOS TV (no mirroring)
+
+`fakehack` can throw the hacked screen **straight onto an LG webOS TV** over Wi-Fi —
+the TV loads the [hosted page](https://nikakirkitadze.github.io/fakehack/) in its own
+browser, so you never mirror your Mac and nothing of yours is shown. Still
+zero-dependency (a tiny built-in webOS client — modern `ssl` + a hand-rolled
+WebSocket, no third-party packages).
+
+```bash
+fakehack tv                                   # auto-discovers the TV on your LAN
+fakehack tv --ip 192.168.1.5 --word PWNED     # or point it straight at the TV
+fakehack tv --ip 192.168.1.5 --target "GIVIKO'S LAPTOP" --duration 30
+```
+
+**One-time pairing.** The *first* cast to a given TV shows a "connect this device?"
+prompt on screen — accept it once with the remote. webOS requires this by design
+(so random devices on the Wi-Fi can't hijack the TV). The client-key is saved to
+`~/.config/fakehack/lgtv.json`, and **every cast after that is silent and instant** —
+no prompt.
+
+**Prank / beta flow:** pair once during setup (one accept on the remote), then every
+later `fakehack tv` just appears on the TV with no confirmation. There is deliberately
+**no way to skip that first accept** on a TV — bypassing it on a set you don't control
+would be real unauthorized access, not a prank.
+
+| `fakehack tv` flag | Default | What it does |
+| --- | --- | --- |
+| `--ip` | auto-discover | TV IP address (SSDP auto-discovery if omitted). |
+| `-w`, `--word` | `HACKED` | Big banner word. |
+| `-t`, `--target` | `DEVICE-07` | Fake victim name in the log. |
+| `-m`, `--message` | | Line under the GOTCHA reveal. |
+| `--headline` | `SYSTEM COMPROMISED` | Big top line. |
+| `-d`, `--duration` | `0` | Auto-reveal GOTCHA after N seconds (0 = stay until dismissed with the TV remote). |
+| `--url` | the hosted page | Base URL to open (use your own fork/host if you like). |
+| `--pair-timeout` | `120` | Seconds to wait for the one-time pairing prompt. |
+
+Dismiss / reveal on the TV by pressing OK on the remote (the page flips to GOTCHA).
+
+> Requires an LG webOS TV on the **same network**, powered on. Tested against a 2024
+> UR-series TV (webOS 24). Other brands aren't supported by `tv` yet — but any
+> smart-TV browser can open the hosted URL directly.
+
 ## Driving it from a script or an AI agent
 
 `fakehack` is safe to automate: it auto-exits after `--duration` and **always
