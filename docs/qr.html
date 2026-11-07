@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scan to download</title>
+<meta name="description" content="A full-screen QR code to share a link on any TV — point a phone camera at it.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --card: #ffffff;
+    --ink: #0e1116;
+    --muted: #5b6672;
+    --accent: #2f6bff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, var(--accent) 28%, transparent), transparent 70%),
+      var(--bg);
+    color: #fff;
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: clamp(1rem, 3.5vh, 2.4rem);
+    padding: clamp(1.2rem, 4vw, 3rem);
+    text-align: center;
+    max-width: 92vw;
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 0.5em;
+    font-weight: 900; letter-spacing: -0.01em;
+    font-size: clamp(1.4rem, 3.2vw, 2.4rem);
+    color: #fff;
+  }
+  .brand .dot {
+    width: 0.62em; height: 0.62em; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 24px var(--accent);
+  }
+  .title {
+    font-weight: 900; margin: 0; line-height: 1.02; text-wrap: balance;
+    font-size: clamp(2rem, 6.5vw, 4.6rem);
+    letter-spacing: -0.02em;
+  }
+  .card {
+    background: var(--card);
+    border-radius: clamp(16px, 2.6vw, 28px);
+    padding: clamp(14px, 2.6vw, 30px);
+    box-shadow: 0 30px 80px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.06);
+    line-height: 0;
+  }
+  #qr { width: clamp(220px, 46vh, 560px); height: clamp(220px, 46vh, 560px); }
+  #qr img, #qr canvas { width: 100% !important; height: 100% !important; display: block; }
+  .fallback {
+    display: none; line-height: 1.4; color: var(--ink);
+    font-weight: 700; word-break: break-all;
+    font-size: clamp(1rem, 2.4vw, 1.6rem); max-width: 46vh;
+  }
+  .caption {
+    margin: 0; color: #c7d0dc; font-weight: 500;
+    font-size: clamp(1.05rem, 2.6vw, 1.9rem);
+  }
+  .link {
+    margin: 0; color: var(--muted); font-weight: 500;
+    font-size: clamp(0.85rem, 1.8vw, 1.1rem); word-break: break-all; max-width: 80vw;
+  }
+  .pulse { animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:.75} 50%{opacity:1} }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand"><span class="dot"></span><span id="brand">AutoXGo</span></div>
+  <h1 class="title" id="title">Scan to download</h1>
+  <div class="card">
+    <div id="qr"></div>
+    <div class="fallback" id="fallback"></div>
+  </div>
+  <p class="caption pulse" id="caption">Point your phone camera at the code</p>
+  <p class="link" id="linktext"></p>
+</div>
+
+<script>
+  var q = new URLSearchParams(location.search);
+  var link = q.get("link") || q.get("url") || "https://autoxgo.app";
+  var title = q.get("title") || "Scan to download";
+  var caption = q.get("caption") || "Point your phone camera at the code";
+  var brand = q.get("brand") || "AutoXGo";
+  var accent = q.get("accent");
+
+  if (accent) {
+    if (/^[0-9a-fA-F]{6}$/.test(accent)) accent = "#" + accent;
+    document.documentElement.style.setProperty("--accent", accent);
+  }
+  document.getElementById("brand").textContent = brand;
+  document.getElementById("title").textContent = title;
+  document.getElementById("caption").textContent = caption;
+  document.getElementById("linktext").textContent = link;
+  document.title = title + " — " + brand;
+
+  function side() {
+    return Math.max(220, Math.round(Math.min(window.innerWidth, window.innerHeight) * 0.46));
+  }
+
+  function showFallback() {
+    document.getElementById("qr").style.display = "none";
+    var fb = document.getElementById("fallback");
+    fb.style.display = "block";
+    fb.textContent = link;
+  }
+
+  function render() {
+    var host = document.getElementById("qr");
+    host.innerHTML = "";
+    if (typeof QRCode === "undefined") { showFallback(); return; }
+    var s = side();
+    try {
+      new QRCode(host, {
+        text: link,
+        width: s,
+        height: s,
+        colorDark: "#0e1116",
+        colorLight: "#ffffff",
+        correctLevel: QRCode.CorrectLevel.H
+      });
+    } catch (e) {
+      showFallback();
+    }
+  }
+
+  if (document.readyState === "loading") {
+    window.addEventListener("DOMContentLoaded", render);
+  } else {
+    render();
+  }
+  var resizeTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(render, 200);
+  });
+  // If the QR library never loaded (offline TV, blocked CDN), fall back.
+  window.setTimeout(function () {
+    if (typeof QRCode === "undefined") showFallback();
+  }, 3000);
+</script>
+</body>
+</html>
